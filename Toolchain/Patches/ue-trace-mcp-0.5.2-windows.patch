@@ -1,0 +1,224 @@
+diff --git a/dist/binary.js b/dist/binary.js
+index 2935c7d..b90e68f 100644
+--- a/dist/binary.js
++++ b/dist/binary.js
+@@ -115,6 +115,28 @@ async function exists(p) {
+         return false;
+     }
+ }
++async function isRegularFile(p) {
++    try {
++        return (await stat(p)).isFile();
++    }
++    catch {
++        return false;
++    }
++}
++async function assertWindowsRuntime(binPath) {
++    if (platform() !== "win32")
++        return;
++    const dir = dirname(resolvePath(binPath));
++    const required = ["TraceDigest.exe", "tbbmalloc.dll", "WinPixEventRuntime.dll"];
++    const missing = [];
++    for (const name of required) {
++        if (!(await isRegularFile(join(dir, name))))
++            missing.push(name);
++    }
++    if (missing.length > 0) {
++        throw new BinaryResolveError(`Windows TraceDigest runtime is incomplete at ${dir}. Missing: ${missing.join(", ")}.`, "TraceDigest.exe, tbbmalloc.dll, and WinPixEventRuntime.dll must be installed side-by-side.");
++    }
++}
+ /**
+  * Download a single URL. Refuses redirects that escape the GitHub-hosted set
+  * (no MITM via DNS hijack to a third-party host), and returns the response
+@@ -216,6 +238,7 @@ export async function ensureBinary(opts = {}) {
+     // 1. Explicit override — always wins. Used by devs against a local build, by
+     // tests against a mock binary, and by users on unsupported platforms.
+     if (process.env.TRACE_DIGEST_BIN) {
++        await assertWindowsRuntime(process.env.TRACE_DIGEST_BIN);
+         return process.env.TRACE_DIGEST_BIN;
+     }
+     const info = detectPlatform();
+@@ -224,7 +247,14 @@ export async function ensureBinary(opts = {}) {
+     const binPath = join(dir, info.binaryName);
+     // 2. Cache hit.
+     if (await exists(binPath)) {
+-        return binPath;
++        try {
++            await assertWindowsRuntime(binPath);
++            return binPath;
++        }
++        catch (error) {
++            if (platform() !== "win32")
++                throw error;
++        }
+     }
+     // 3. Download + checksum-verify + extract. Filename and expected hash come
+     // from the manifest baked into this npm package — NOT from a sibling file
+@@ -263,6 +293,7 @@ export async function ensureBinary(opts = {}) {
+     if (!(await exists(binPath))) {
+         throw new BinaryResolveError(`binary not found at ${binPath} after extracting ${archiveName}`, `The release archive may have an unexpected layout. Set TRACE_DIGEST_BIN to bypass.`);
+     }
++    await assertWindowsRuntime(binPath);
+     // chmod +x for POSIX (no-op on Windows where the extension determines execability).
+     await chmod(binPath, 0o755).catch(() => undefined);
+     if (!opts.quiet) {
+diff --git a/dist/digest.js b/dist/digest.js
+index 82a75d9..10c6559 100644
+--- a/dist/digest.js
++++ b/dist/digest.js
+@@ -1,6 +1,8 @@
+ import { spawn } from "node:child_process";
+-import { access, constants } from "node:fs/promises";
+-import { resolve as resolvePath } from "node:path";
++import { access, constants, readFile, rm } from "node:fs/promises";
++import { randomBytes } from "node:crypto";
++import { tmpdir } from "node:os";
++import { join, resolve as resolvePath } from "node:path";
+ export class TraceDigestError extends Error {
+     exitCode;
+     stderr;
+@@ -180,20 +182,58 @@ async function runViaDaemon(args, registry) {
+ }
+ async function runBinary(binary, args, opts) {
+     const maxStdout = opts.maxStdoutBytes ?? 256 * 1024 * 1024;
+-    const timeout = opts.timeoutMs ?? 60_000;
+-    const argv = buildBinaryArgv(args);
++    // Windows one-shot re-parses the whole .utrace per call; memalloc-heavy
++    // captures routinely exceed the historical 60s ceiling.
++    const defaultTimeout = process.platform === "win32" ? 300_000 : 60_000;
++    const timeout = opts.timeoutMs ?? Number(process.env.TRACE_ONESHOT_TIMEOUT_MS ?? defaultTimeout);
++    const outPath = process.platform === "win32"
++        ? join(tmpdir(), `ue-trace-mcp-${process.pid}-${randomBytes(8).toString("hex")}.json`)
++        : undefined;
++    const argv = buildBinaryArgv(args, outPath);
+     return new Promise((resolve, reject) => {
+-        const child = spawn(binary, argv, { stdio: ["ignore", "pipe", "pipe"] });
++        const stdoutTailBytes = 64 * 1024;
+         const stdoutChunks = [];
++        let stdoutTail = Buffer.alloc(0);
+         let stdoutLen = 0;
+         let stderr = "";
+         let killedForOverflow = false;
+         let killedForTimeout = false;
+-        const timer = setTimeout(() => {
++        let settled = false;
++        let timer;
++        let child;
++        const finish = async (error, value) => {
++            if (settled)
++                return;
++            settled = true;
++            if (timer)
++                clearTimeout(timer);
++            if (outPath)
++                await rm(outPath, { force: true }).catch(() => undefined);
++            if (error)
++                reject(error);
++            else
++                resolve(value);
++        };
++        try {
++            child = spawn(binary, argv, { stdio: ["ignore", "pipe", "pipe"] });
++        }
++        catch (err) {
++            const message = err instanceof Error ? err.message : String(err);
++            void finish(new TraceDigestError(`failed to spawn ${binary}: ${message}`, null, stderr));
++            return;
++        }
++        timer = setTimeout(() => {
+             killedForTimeout = true;
+             child.kill("SIGKILL");
+         }, timeout);
+         child.stdout.on("data", (chunk) => {
++            if (outPath) {
++                const combined = Buffer.concat([stdoutTail, chunk]);
++                stdoutTail = combined.length > stdoutTailBytes
++                    ? Buffer.from(combined.subarray(combined.length - stdoutTailBytes))
++                    : combined;
++                return;
++            }
+             stdoutLen += chunk.byteLength;
+             if (stdoutLen > maxStdout) {
+                 killedForOverflow = true;
+@@ -205,26 +245,29 @@ async function runBinary(binary, args, opts) {
+         child.stderr.on("data", (chunk) => {
+             stderr += chunk.toString("utf8");
+         });
+-        child.on("error", (err) => {
+-            clearTimeout(timer);
+-            reject(new TraceDigestError(`failed to spawn ${binary}: ${err.message}`, null, stderr));
++        child.once("error", (err) => {
++            void finish(new TraceDigestError(`failed to spawn ${binary}: ${err.message}`, null, stderr));
+         });
+-        child.on("close", (code) => {
+-            clearTimeout(timer);
+-            if (killedForTimeout)
+-                return reject(new TraceDigestError(`TraceDigest timed out after ${timeout}ms`, code, stderr));
+-            if (killedForOverflow)
+-                return reject(new TraceDigestError(`TraceDigest stdout exceeded ${maxStdout} bytes`, code, stderr));
+-            if (code !== 0)
+-                return reject(new TraceDigestError(`TraceDigest exited with code ${code}`, code, stderr));
+-            const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+-            try {
+-                const parsed = extractTrailingJson(stdout);
+-                resolve(parsed);
+-            }
+-            catch (e) {
+-                reject(new TraceDigestError(`TraceDigest output was not parseable JSON: ${e.message}`, code, stderr + "\n--- stdout tail ---\n" + stdout.slice(-2048)));
+-            }
++        child.once("close", (code) => {
++            void (async () => {
++                if (settled)
++                    return;
++                if (killedForTimeout)
++                    return finish(new TraceDigestError(`TraceDigest timed out after ${timeout}ms`, code, stderr));
++                if (killedForOverflow)
++                    return finish(new TraceDigestError(`TraceDigest stdout exceeded ${maxStdout} bytes`, code, stderr));
++                if (code !== 0)
++                    return finish(new TraceDigestError(`TraceDigest exited with code ${code}`, code, stderr));
++                const stdout = outPath ? stdoutTail.toString("utf8") : Buffer.concat(stdoutChunks).toString("utf8");
++                try {
++                    const raw = outPath ? await readFile(outPath, "utf8") : stdout;
++                    const parsed = outPath ? JSON.parse(raw) : extractTrailingJson(raw);
++                    await finish(null, parsed);
++                }
++                catch (e) {
++                    await finish(new TraceDigestError(`TraceDigest output was not parseable JSON: ${e.message}`, code, stderr + "\n--- stdout tail ---\n" + stdout.slice(-2048)));
++                }
++            })();
+         });
+     });
+ }
+@@ -287,4 +330,4 @@ async function assertExecutable(path) {
+         throw new TraceDigestError(`runner not found or not executable: ${abs}`, null, e.message);
+     }
+ }
+-//# sourceMappingURL=digest.js.map
+\ No newline at end of file
++//# sourceMappingURL=digest.js.map
+diff --git a/dist/index.js b/dist/index.js
+index f7e1308..4dc5429 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -29,6 +29,7 @@ async function main() {
+     const { server, daemons } = createServer({
+         runOptions: { binary },
+         cacheSize: Number(process.env.TRACE_CACHE_SIZE ?? 5),
++        enableDaemon: process.platform !== "win32",
+     });
+     // MCP shutdown reaper: when the client disconnects or we get a signal, kill
+     // every daemon we spawned. Daemons also self-time-out as defense in depth,
+diff --git a/dist/server.js b/dist/server.js
+index 620fc84..4cb70f2 100644
+--- a/dist/server.js
++++ b/dist/server.js
+@@ -59,7 +59,7 @@ export function createServer(opts = {}) {
+     // Editor-commandlet mode doesn't support daemon (we don't want to keep an
+     // entire editor process resident per trace).
+     const binary = runOptions.binary ?? process.env.TRACE_DIGEST_BIN;
+-    const enableDaemon = (opts.enableDaemon ?? true) && !!binary;
++    const enableDaemon = process.platform !== "win32" && (opts.enableDaemon ?? true) && !!binary;
+     const daemons = opts.daemons ??
+         (enableDaemon
+             ? new DaemonRegistry({

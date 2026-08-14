@@ -1,2 +1,0 @@
-[console_scripts]
-ue-insight-mcp = ue_insight_mcp.server_unified:main

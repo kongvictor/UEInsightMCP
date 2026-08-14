@@ -1,0 +1,15 @@
+# UE build artifacts
+Binaries/
+Intermediate/
+Build/
+
+# Editor-generated plugin config
+Config/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+Python/vendor/

@@ -1,9 +1,0 @@
-Metadata-Version: 2.4
-Name: ue-insight-mcp
-Version: 0.1.0
-Summary: Unreal Insights MCP Server — AI-driven Trace & performance analysis
-Author: yangskin
-License: MIT
-Requires-Python: >=3.10
-Description-Content-Type: text/markdown
-Requires-Dist: mcp>=1.0.0
