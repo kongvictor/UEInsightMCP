@@ -43,8 +43,8 @@ public:
 		const FString& CommandType,
 		const TSharedPtr<FJsonObject>& Params);
 
-	/** Get the current Trace context */
-	FInsightContext& GetContext() { return Context; }
+	/** Get the current Trace context, reconciled with the native Trace connection. */
+	FInsightContext& GetContext() { Context.RefreshTraceStateFromNative(); return Context; }
 	const FInsightContext& GetContext() const { return Context; }
 
 	/**

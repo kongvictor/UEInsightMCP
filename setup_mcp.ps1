@@ -28,7 +28,7 @@ Write-Host "Creating vendor directory..."
 New-Item -ItemType Directory -Force -Path $VendorDir | Out-Null
 
 Write-Host "Downloading MCP wheels..."
-python -m pip download mcp --dest $VendorDir --only-binary=:all:
+python -m pip download mcp==1.26.0 --dest $VendorDir --only-binary=:all:
 
 Write-Host ""
 Write-Host "Setup complete!"

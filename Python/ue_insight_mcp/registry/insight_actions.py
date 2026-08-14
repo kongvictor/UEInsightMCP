@@ -32,8 +32,12 @@ TRACE_CONTROL_ACTIONS = [
             "properties": {
                 "channels": {
                     "type": "string",
-                    "description": "Comma-separated channel names. Default: cpu,gpu,frame,memory,loadtime",
-                    "default": "cpu,gpu,frame,memory,loadtime",
+                    "description": (
+                        "Comma-separated channels or presets. Default: cpu,gpu,frame,bookmark,loadtime. "
+                        "The memory preset expands to memtag,memalloc,callstack,module; read-only members "
+                        "must already be enabled through Unreal process startup arguments."
+                    ),
+                    "default": "cpu,gpu,frame,bookmark,loadtime",
                 },
                 "output": {
                     "type": "string",
@@ -43,15 +47,28 @@ TRACE_CONTROL_ACTIONS = [
                 },
                 "host": {
                     "type": "string",
-                    "description": "Trace Server host (only used when output='server')",
+                    "description": "Trace Server recorder host (only used when output='server')",
                     "default": "127.0.0.1",
+                },
+                "replace_existing": {
+                    "type": "boolean",
+                    "description": (
+                        "Temporarily replace an existing external/startup Trace connection. "
+                        "The previous network stream can be restored by trace.stop."
+                    ),
+                    "default": False,
+                },
+                "include_tail": {
+                    "type": "boolean",
+                    "description": "Include Trace data buffered before this capture. Default false for focused captures.",
+                    "default": False,
                 },
             },
         },
         examples=(
-            {"channels": "cpu,gpu,frame", "output": "file"},
-            {"channels": "cpu,gpu,frame,memory,loadtime,bookmark", "output": "file"},
-            {"output": "server", "host": "127.0.0.1"},
+            {"channels": "cpu,gpu,frame,bookmark", "output": "file", "replace_existing": True},
+            {"channels": "cpu,gpu,frame,loadtime,bookmark", "output": "file"},
+            {"output": "server", "host": "127.0.0.1", "replace_existing": True},
         ),
         capabilities=("write",),
         risk="safe",
@@ -61,13 +78,25 @@ TRACE_CONTROL_ACTIONS = [
         id="trace.stop",
         command="trace.stop",
         tags=("trace", "stop", "end", "finish", "record"),
-        description="Stop the current Trace recording and return file info",
+        description="Stop the current Trace recording, settle file metadata, and optionally restore the previous stream",
         input_schema={
             "type": "object",
-            "properties": {},
+            "properties": {
+                "restore_previous": {
+                    "type": "boolean",
+                    "description": "Restore the external network Trace replaced by trace.start. Default true.",
+                    "default": True,
+                },
+                "force_external": {
+                    "type": "boolean",
+                    "description": "Explicitly allow stopping a Trace not started by MCP. Default false.",
+                    "default": False,
+                },
+            },
         },
         examples=(
-            {},
+            {"restore_previous": True},
+            {"force_external": True, "restore_previous": False},
         ),
         capabilities=("write",),
         risk="safe",
@@ -109,7 +138,7 @@ TRACE_CONTROL_ACTIONS = [
         id="trace.channels.toggle",
         command="trace.channels.toggle",
         tags=("trace", "channels", "toggle", "enable", "disable", "switch"),
-        description="Enable or disable specific Trace channels",
+        description="Enable or disable runtime-toggleable Trace channels; startup-only/read-only changes are rejected",
         input_schema={
             "type": "object",
             "properties": {
@@ -126,7 +155,7 @@ TRACE_CONTROL_ACTIONS = [
             "required": ["channels"],
         },
         examples=(
-            {"channels": "memory,loadtime", "enable": True},
+            {"channels": "loadtime,counters", "enable": True},
             {"channels": "gpu", "enable": False},
         ),
         capabilities=("write",),

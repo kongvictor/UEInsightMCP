@@ -19,6 +19,7 @@ void UInsightBridge::Initialize(FSubsystemCollectionBase& Collection)
 
 	UE_LOG(LogInsightMCP, Log, TEXT("UEInsightMCP: Bridge initializing"));
 
+	Context.RefreshTraceStateFromNative();
 	RegisterActions();
 
 	Server = new FInsightServer(this, DefaultPort);

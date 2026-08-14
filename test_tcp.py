@@ -80,8 +80,10 @@ def main():
         resp = send_recv(s, {
             "type": "trace.start",
             "params": {
-                "mode": "file",
-                "channels": "cpu,frame,bookmark"
+                "output": "file",
+                "channels": "cpu,frame,bookmark",
+                "replace_existing": True,
+                "include_tail": False
             }
         })
         print(f"  Response: {json.dumps(resp, indent=2)}")
@@ -106,7 +108,7 @@ def main():
         
         # Test 8: trace.stop
         print("=== Test 8: trace.stop ===")
-        resp = send_recv(s, {"type": "trace.stop", "params": {}})
+        resp = send_recv(s, {"type": "trace.stop", "params": {"restore_previous": True}})
         print(f"  Response: {json.dumps(resp, indent=2)}")
         print(f"  Status: {'PASS ✓' if resp.get('status') == 'success' else 'FAIL ✗'}\n")
         

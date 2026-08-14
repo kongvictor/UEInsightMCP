@@ -12,7 +12,7 @@ license = {text = "MIT"}
 authors = [{name = "yangskin"}]
 
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp==1.26.0",
 ]
 
 [project.scripts]

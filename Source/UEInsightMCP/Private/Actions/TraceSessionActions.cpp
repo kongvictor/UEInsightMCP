@@ -19,6 +19,18 @@
 #include "TraceServices/Model/Memory.h"
 #endif
 
+namespace
+{
+	FString NormalizeSessionPath(const FString& Path)
+	{
+		FString Absolute = FPaths::ConvertRelativePathToFull(Path);
+		FPaths::CollapseRelativeDirectories(Absolute);
+		Absolute = IFileManager::Get().ConvertToAbsolutePathForExternalAppForRead(*Absolute);
+		FPaths::NormalizeFilename(Absolute);
+		return Absolute;
+	}
+}
+
 
 // ============================================================================
 // session.list — List available .utrace files
@@ -43,6 +55,11 @@ TSharedPtr<FJsonObject> FSessionListAction::ExecuteInternal(
 	{
 		SearchDir = FInsightContext::GetDefaultTraceDir();
 	}
+	else
+	{
+		SearchDir = NormalizeSessionPath(SearchDir);
+	}
+	FPaths::NormalizeDirectoryName(SearchDir);
 
 	// 2. Find all .utrace files
 	TArray<FString> FoundFiles;
@@ -62,7 +79,7 @@ TSharedPtr<FJsonObject> FSessionListAction::ExecuteInternal(
 	for (const FString& FilePath : FoundFiles)
 	{
 		FFileInfo Info;
-		Info.Path = FilePath;
+		Info.Path = NormalizeSessionPath(FilePath);
 		Info.Name = FPaths::GetCleanFilename(FilePath);
 		Info.Size = FileManager.FileSize(*FilePath);
 
@@ -118,8 +135,8 @@ TSharedPtr<FJsonObject> FSessionListAction::ExecuteInternal(
 		FileObj->SetStringField(TEXT("modified"), Info.ModTime.ToString());
 
 		// Mark if this is the currently loaded session
-		FileObj->SetBoolField(TEXT("is_current"), 
-			Context.bSessionLoaded && Info.Path == Context.CurrentSessionFile);
+		FileObj->SetBoolField(TEXT("is_current"),
+			Context.bSessionLoaded && FPaths::IsSamePath(Info.Path, Context.CurrentSessionFile));
 
 		FilesArray.Add(MakeShared<FJsonValueObject>(FileObj));
 	}
@@ -153,6 +170,7 @@ bool FSessionOpenAction::Validate(
 		return false;
 	}
 
+	FilePath = NormalizeSessionPath(FilePath);
 	if (!IFileManager::Get().FileExists(*FilePath))
 	{
 		OutError = FString::Printf(TEXT("File not found: %s"), *FilePath);
@@ -170,6 +188,7 @@ TSharedPtr<FJsonObject> FSessionOpenAction::ExecuteInternal(
 	FString FilePath;
 	FString Unused;
 	GetRequiredString(Params, TEXT("file"), FilePath, Unused);
+	FilePath = NormalizeSessionPath(FilePath);
 
 	// Close existing session if any
 	if (Context.bSessionLoaded)

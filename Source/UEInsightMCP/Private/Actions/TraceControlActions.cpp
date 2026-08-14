@@ -9,8 +9,14 @@
 #include "Trace/Trace.h"
 #include "Misc/Paths.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformProcess.h"
 #include "Misc/DateTime.h"
+#include "Misc/StringBuilder.h"
 #include "Editor.h"                        // GEditor — needed by FBatchExecuteInsightAction
+
+#if ENGINE_MAJOR_VERSION >= 5
+#include "Trace/Detail/Channel.h"
+#endif
 
 // Version compat: UE5 uses UE::Trace namespace, UE4 uses Trace namespace
 #if ENGINE_MAJOR_VERSION >= 5
@@ -27,41 +33,229 @@ namespace InsightMCPCompat
 	// We provide a known-channel list based on RDCSP engine source analysis.
 	// These are the channels registered via UE_TRACE_CHANNEL / UE_TRACE_CHANNEL_EXTERN.
 	static const TCHAR* const KnownChannels[] = {
-		// Core profiling channels (Runtime/Core)
-		TEXT("cpu"),
-		TEXT("gpu"),
-		TEXT("frame"),
-		TEXT("bookmark"),
-		TEXT("counters"),
-		TEXT("log"),
-		TEXT("file"),
-		TEXT("loadtime"),
-		TEXT("memory"),
-		// Networking
-		TEXT("net"),
-		// Slate UI
-		TEXT("slate"),
-		// Rendering
-		TEXT("rhicommands"),
-		TEXT("rendercommands"),
-		// Animation
-		TEXT("animation"),
-		// Physics
-		TEXT("physics"),
-		// Network Prediction
-		TEXT("networkprediction"),
-		// Niagara
-		TEXT("niagara"),
-		// Trace source filters
-		TEXT("tracesourcefilters"),
-		// CSV profiler
-		TEXT("csv"),
-		// Object trace
-		TEXT("object"),
+		TEXT("cpu"), TEXT("gpu"), TEXT("frame"), TEXT("bookmark"),
+		TEXT("counters"), TEXT("log"), TEXT("file"), TEXT("loadtime"),
+		TEXT("memory"), TEXT("net"), TEXT("slate"), TEXT("rhicommands"),
+		TEXT("rendercommands"), TEXT("animation"), TEXT("physics"),
+		TEXT("networkprediction"), TEXT("niagara"), TEXT("tracesourcefilters"),
+		TEXT("csv"), TEXT("object"),
 	};
 	static constexpr int32 NumKnownChannels = UE_ARRAY_COUNT(KnownChannels);
 }
 #endif
+
+namespace
+{
+	struct FChannelInfoSnapshot
+	{
+		FString Name;
+		FString RawName;
+		FString Description;
+		bool bEnabled = false;
+		bool bReadOnly = false;
+	};
+
+	FString CanonicalChannelName(const FString& InName)
+	{
+		FString Name = InName;
+		Name.TrimStartAndEndInline();
+		Name.RemoveFromEnd(TEXT("Channel"), ESearchCase::IgnoreCase);
+		Name.ToLowerInline();
+		return Name;
+	}
+
+	void EnumerateChannelSnapshots(TArray<FChannelInfoSnapshot>& OutChannels)
+	{
+		OutChannels.Empty();
+#if ENGINE_MAJOR_VERSION >= 5
+		UE::Trace::EnumerateChannels(
+			[](const UE::Trace::FChannelInfo& Info, void* UserData) -> bool
+			{
+				auto* Channels = static_cast<TArray<FChannelInfoSnapshot>*>(UserData);
+				FChannelInfoSnapshot Snapshot;
+				Snapshot.RawName = ANSI_TO_TCHAR(Info.Name);
+				Snapshot.Name = CanonicalChannelName(Snapshot.RawName);
+				Snapshot.Description = Info.Desc ? ANSI_TO_TCHAR(Info.Desc) : TEXT("");
+				Snapshot.bEnabled = Info.bIsEnabled;
+				Snapshot.bReadOnly = Info.bIsReadOnly;
+				Channels->Add(MoveTemp(Snapshot));
+				return true;
+			},
+			&OutChannels);
+#else
+		for (int32 Index = 0; Index < InsightMCPCompat::NumKnownChannels; ++Index)
+		{
+			const TCHAR* Name = InsightMCPCompat::KnownChannels[Index];
+			if (Trace::IsChannel(Name))
+			{
+				FChannelInfoSnapshot Snapshot;
+				Snapshot.Name = Name;
+				Snapshot.RawName = Name;
+				Snapshot.bEnabled = false;
+				OutChannels.Add(MoveTemp(Snapshot));
+			}
+		}
+#endif
+	}
+
+	const FChannelInfoSnapshot* FindChannelSnapshot(
+		const TArray<FChannelInfoSnapshot>& Channels,
+		const FString& RequestedName)
+	{
+		const FString Canonical = CanonicalChannelName(RequestedName);
+		return Channels.FindByPredicate([&Canonical](const FChannelInfoSnapshot& Channel)
+		{
+			return Channel.Name.Equals(Canonical, ESearchCase::IgnoreCase);
+		});
+	}
+
+	void ExpandChannelTokens(const FString& ChannelString, TArray<FString>& OutChannels)
+	{
+		TArray<FString> Tokens;
+		ChannelString.ParseIntoArray(Tokens, TEXT(","), true);
+		for (FString& Token : Tokens)
+		{
+			Token = CanonicalChannelName(Token);
+			if (Token == TEXT("memory"))
+			{
+				OutChannels.Append({TEXT("memtag"), TEXT("memalloc"), TEXT("callstack"), TEXT("module")});
+			}
+			else if (Token == TEXT("default"))
+			{
+				OutChannels.Append({TEXT("cpu"), TEXT("gpu"), TEXT("frame"), TEXT("log"), TEXT("bookmark"), TEXT("screenshot"), TEXT("region")});
+			}
+			else if (!Token.IsEmpty())
+			{
+				OutChannels.Add(Token);
+			}
+		}
+
+		TSet<FString> Seen;
+		OutChannels.RemoveAll([&Seen](const FString& Channel)
+		{
+			if (Seen.Contains(Channel))
+			{
+				return true;
+			}
+			Seen.Add(Channel);
+			return false;
+		});
+	}
+
+	FString JoinChannels(const TSet<FString>& Channels)
+	{
+		TArray<FString> Sorted = Channels.Array();
+		Sorted.Sort();
+		return FString::Join(Sorted, TEXT(","));
+	}
+
+	FString NormalizeTraceFilePath(const FString& Path)
+	{
+		if (Path.IsEmpty())
+		{
+			return Path;
+		}
+		FString Absolute = FPaths::ConvertRelativePathToFull(Path);
+		FPaths::CollapseRelativeDirectories(Absolute);
+		Absolute = IFileManager::Get().ConvertToAbsolutePathForExternalAppForWrite(*Absolute);
+		FPaths::NormalizeFilename(Absolute);
+		return Absolute;
+	}
+
+	bool FindUnavailableStartupChannels(const FString& ChannelString, TArray<FString>& OutMissing)
+	{
+		TArray<FString> Requested;
+		ExpandChannelTokens(ChannelString, Requested);
+
+		TArray<FChannelInfoSnapshot> Available;
+		EnumerateChannelSnapshots(Available);
+		for (const FString& Name : Requested)
+		{
+			const FChannelInfoSnapshot* Channel = FindChannelSnapshot(Available, Name);
+			if (Channel && Channel->bReadOnly && !Channel->bEnabled)
+			{
+				OutMissing.Add(Channel->Name);
+			}
+		}
+		return OutMissing.Num() > 0;
+	}
+
+	struct FFileSettlement
+	{
+		bool bExists = false;
+		bool bSizeKnown = false;
+		bool bPending = false;
+		int64 Size = 0;
+	};
+
+	FFileSettlement WaitForFileSettlement(const FString& FilePath, double TimeoutSeconds = 0.5)
+	{
+		FFileSettlement Result;
+		IFileManager& FileManager = IFileManager::Get();
+		const double Deadline = FPlatformTime::Seconds() + TimeoutSeconds;
+		int64 PreviousSize = -1;
+		int32 StableReads = 0;
+
+		do
+		{
+			Result.bExists = FileManager.FileExists(*FilePath);
+			if (Result.bExists)
+			{
+				const int64 CurrentSize = FileManager.FileSize(*FilePath);
+				if (CurrentSize >= 0 && CurrentSize == PreviousSize)
+				{
+					++StableReads;
+					if (StableReads >= 2)
+					{
+						Result.bSizeKnown = true;
+						Result.Size = CurrentSize;
+						return Result;
+					}
+				}
+				else
+				{
+					StableReads = 0;
+				}
+				PreviousSize = CurrentSize;
+				Result.Size = FMath::Max<int64>(CurrentSize, 0);
+			}
+			FPlatformProcess::Sleep(0.025f);
+		}
+		while (FPlatformTime::Seconds() < Deadline);
+
+		Result.bPending = true;
+		return Result;
+	}
+
+#if ENGINE_MAJOR_VERSION >= 5
+	bool RestorePreviousNetworkTrace(FInsightContext& Context)
+	{
+		if (!Context.bHasPreviousTrace ||
+			Context.PreviousConnectionType != FTraceAuxiliary::EConnectionType::Network ||
+			Context.PreviousTraceDestination.IsEmpty())
+		{
+			Context.ClearPreviousTraceState();
+			return false;
+		}
+
+		const FString Destination = Context.PreviousTraceDestination;
+		const FString Channels = Context.PreviousTraceChannels.IsEmpty()
+			? TEXT("default")
+			: Context.PreviousTraceChannels;
+		Context.ClearPreviousTraceState();
+
+		FTraceAuxiliary::FOptions Options;
+		Options.bExcludeTail = false;
+		const bool bRestored = FTraceAuxiliary::Start(
+			FTraceAuxiliary::EConnectionType::Network,
+			*Destination,
+			*Channels,
+			&Options);
+		Context.RefreshTraceStateFromNative();
+		return bRestored;
+	}
+#endif
+}
 
 
 // ============================================================================
@@ -73,11 +267,42 @@ bool FTraceStartAction::Validate(
 	FInsightContext& Context,
 	FString& OutError)
 {
-	if (Context.bIsTracing)
+	Context.RefreshTraceStateFromNative();
+
+	const FString OutputMode = GetOptionalString(Params, TEXT("output"), TEXT("file"));
+	if (OutputMode != TEXT("file") && OutputMode != TEXT("server"))
 	{
-		OutError = TEXT("Trace is already running. Call trace.stop first.");
+		OutError = TEXT("Parameter 'output' must be 'file' or 'server'.");
 		return false;
 	}
+
+	if (Context.bIsTracing)
+	{
+		if (Context.bTraceStartedByMCP)
+		{
+			OutError = TEXT("An MCP-managed Trace is already running. Call trace.stop first.");
+			return false;
+		}
+		if (!GetOptionalBool(Params, TEXT("replace_existing"), false))
+		{
+			OutError = FString::Printf(
+				TEXT("An external Trace is already connected (%s: %s). Set replace_existing=true to replace it temporarily."),
+				*FInsightContext::ConnectionTypeToString(Context.ActiveConnectionType),
+				*Context.ActiveTraceDestination);
+			return false;
+		}
+	}
+
+	const FString ChannelString = GetOptionalString(Params, TEXT("channels"), TEXT("cpu,gpu,frame,bookmark,loadtime"));
+	TArray<FString> MissingStartupChannels;
+	if (FindUnavailableStartupChannels(ChannelString, MissingStartupChannels))
+	{
+		OutError = FString::Printf(
+			TEXT("Startup-only Trace channels are not enabled: %s. Relaunch Unreal Editor with these channels in -trace before recording."),
+			*FString::Join(MissingStartupChannels, TEXT(",")));
+		return false;
+	}
+
 	return true;
 }
 
@@ -85,135 +310,161 @@ TSharedPtr<FJsonObject> FTraceStartAction::ExecuteInternal(
 	const TSharedPtr<FJsonObject>& Params,
 	FInsightContext& Context)
 {
-	// 1. Parse channels
-	FString ChannelStr = GetOptionalString(Params, TEXT("channels"), TEXT("cpu,gpu,frame,bookmark,loadtime"));
-	TArray<FString> Channels;
-	ChannelStr.ParseIntoArray(Channels, TEXT(","));
+	Context.RefreshTraceStateFromNative();
 
-	// Build a clean comma-separated channel string
-	FString CleanChannelStr;
-	for (int32 i = 0; i < Channels.Num(); ++i)
+	FString ChannelString = GetOptionalString(Params, TEXT("channels"), TEXT("cpu,gpu,frame,bookmark,loadtime"));
+	TArray<FString> RequestedChannels;
+	ChannelString.ParseIntoArray(RequestedChannels, TEXT(","), true);
+	for (FString& Channel : RequestedChannels)
 	{
-		if (i > 0) CleanChannelStr += TEXT(",");
-		CleanChannelStr += Channels[i].TrimStartAndEnd();
+		Channel.TrimStartAndEndInline();
 	}
+	ChannelString = FString::Join(RequestedChannels, TEXT(","));
 
-	// 2. Output mode
-	FString OutputMode = GetOptionalString(Params, TEXT("output"), TEXT("file"));
+	const FString OutputMode = GetOptionalString(Params, TEXT("output"), TEXT("file"));
+	const bool bIncludeTail = GetOptionalBool(Params, TEXT("include_tail"), false);
 
-	// 3. Start Trace
+#if ENGINE_MAJOR_VERSION >= 5
+	if (Context.bIsTracing)
+	{
+		Context.bHasPreviousTrace = true;
+		Context.PreviousConnectionType = Context.ActiveConnectionType;
+		Context.PreviousTraceDestination = Context.ActiveTraceDestination;
+		Context.PreviousTraceChannels = JoinChannels(Context.EnabledChannels);
+
+		if (!FTraceAuxiliary::Stop())
+		{
+			Context.ClearPreviousTraceState();
+			return CreateErrorResponse(TEXT("Failed to stop the existing Trace connection"), TEXT("trace_replace_failed"));
+		}
+		Context.ClearActiveTraceState();
+		FPlatformProcess::Sleep(0.05f);
+	}
+#endif
+
 	FString TraceFile;
+	FString Target;
 	bool bStarted = false;
 
 #if ENGINE_MAJOR_VERSION >= 5
-	// ── UE5 path: FTraceAuxiliary::Start (full API) ──
+	FTraceAuxiliary::FOptions Options;
+	Options.bExcludeTail = !bIncludeTail;
+	Options.bNoWorkerThread = false;
+
 	if (OutputMode == TEXT("file"))
 	{
-		TraceFile = FInsightContext::GetDefaultTraceDir() /
-			FString::Printf(TEXT("Trace_%s.utrace"),
-				*FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S")));
-
+		TraceFile = NormalizeTraceFilePath(
+			FInsightContext::GetDefaultTraceDir() /
+			FString::Printf(TEXT("Trace_%s.utrace"), *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"))));
 		IFileManager::Get().MakeDirectory(*FPaths::GetPath(TraceFile), true);
-
-		FTraceAuxiliary::FOptions Options;
-		Options.bExcludeTail = false;
-		Options.bNoWorkerThread = false;
-
+		Target = TraceFile;
 		bStarted = FTraceAuxiliary::Start(
 			FTraceAuxiliary::EConnectionType::File,
-			*TraceFile, *CleanChannelStr, &Options);
+			*Target,
+			*ChannelString,
+			&Options);
 	}
-	else // "server" mode
+	else
 	{
-		FString Host = GetOptionalString(Params, TEXT("host"), TEXT("127.0.0.1"));
+		Target = GetOptionalString(Params, TEXT("host"), TEXT("127.0.0.1"));
 		bStarted = FTraceAuxiliary::Start(
 			FTraceAuxiliary::EConnectionType::Network,
-			*Host, *CleanChannelStr, nullptr);
+			*Target,
+			*ChannelString,
+			&Options);
 	}
 #else
-	// ── UE4 RDCSP path: Trace::WriteTo / Trace::SendTo directly ──
-	// Step 1: Enable channels first (Trace::ToggleChannel)
-	for (const FString& Ch : Channels)
+	for (const FString& Channel : RequestedChannels)
 	{
-		FString TrimmedCh = Ch.TrimStartAndEnd();
-		if (Trace::IsChannel(*TrimmedCh))
+		if (Trace::IsChannel(*Channel))
 		{
-			Trace::ToggleChannel(*TrimmedCh, true);
-		}
-		else
-		{
-			UE_LOG(LogInsightMCP, Warning, TEXT("Unknown trace channel: '%s'"), *TrimmedCh);
+			Trace::ToggleChannel(*Channel, true);
 		}
 	}
 
-	// Step 2: Start writer
 	if (OutputMode == TEXT("file"))
 	{
-		TraceFile = FInsightContext::GetDefaultTraceDir() /
-			FString::Printf(TEXT("Trace_%s.utrace"),
-				*FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S")));
-
-		IFileManager::Get().MakeDirectory(*FPaths::GetPath(TraceFile), true);
-
-		// Convert to absolute path (UE4 Trace::WriteTo requires absolute path)
-		FString AbsoluteTraceFile = FPaths::ConvertRelativePathToFull(TraceFile);
-		bStarted = Trace::WriteTo(*AbsoluteTraceFile);
-		if (bStarted)
-		{
-			TraceFile = AbsoluteTraceFile;
-		}
+		TraceFile = NormalizeTraceFilePath(
+			FInsightContext::GetDefaultTraceDir() /
+			FString::Printf(TEXT("Trace_%s.utrace"), *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"))));
+		Target = TraceFile;
+		bStarted = Trace::WriteTo(*TraceFile);
 	}
-	else // "server" mode
+	else
 	{
-		FString Host = GetOptionalString(Params, TEXT("host"), TEXT("127.0.0.1"));
+		Target = GetOptionalString(Params, TEXT("host"), TEXT("127.0.0.1"));
 		uint32 Port = static_cast<uint32>(GetOptionalNumber(Params, TEXT("port"), 0.0));
 		if (Port == 0)
 		{
-			Port = Trace::GetConnectPort();  // RDCSP extension, default 8001
+			Port = Trace::GetConnectPort();
 		}
-		bStarted = Trace::SendTo(*Host, Port);
+		bStarted = Trace::SendTo(*Target, Port);
 	}
 #endif
 
 	if (!bStarted)
 	{
+#if ENGINE_MAJOR_VERSION >= 5
+		const bool bRestored = RestorePreviousNetworkTrace(Context);
+		UE_LOG(LogInsightMCP, Warning, TEXT("Trace start failed; previous network trace restored=%s"), bRestored ? TEXT("true") : TEXT("false"));
+#endif
 		return CreateErrorResponse(
 			FString::Printf(TEXT("Failed to start Trace in '%s' mode"), *OutputMode),
 			TEXT("trace_start_failed"));
 	}
 
-	// 4. Update context
-	Context.bIsTracing = true;
-	Context.ActiveTraceFile = TraceFile;
-	Context.EnabledChannels.Empty();
-	for (const FString& Ch : Channels)
+#if ENGINE_MAJOR_VERSION >= 5
+	FTraceAuxiliary::EConnectionType ConnectionType = OutputMode == TEXT("file")
+		? FTraceAuxiliary::EConnectionType::File
+		: FTraceAuxiliary::EConnectionType::Network;
+	FString NativeDestination = FTraceAuxiliary::GetTraceDestinationString();
+	if (ConnectionType == FTraceAuxiliary::EConnectionType::File)
 	{
-		Context.EnabledChannels.Add(Ch.TrimStartAndEnd());
+		NativeDestination = NormalizeTraceFilePath(NativeDestination.IsEmpty() ? TraceFile : NativeDestination);
+		TraceFile = NativeDestination;
 	}
+	else if (NativeDestination.IsEmpty())
+	{
+		NativeDestination = Target;
+	}
+	Context.MarkMCPTraceStarted(ConnectionType, NativeDestination);
+#else
+	Context.bIsTracing = true;
+	Context.bTraceStartedByMCP = true;
+	Context.bTraceStartTimeKnown = true;
 	Context.TraceStartTime = FPlatformTime::Seconds();
+	Context.ActiveTraceFile = TraceFile;
+	Context.ActiveTraceDestination = Target;
+	Context.EnabledChannels = TSet<FString>(RequestedChannels);
+#endif
 	Context.InvalidateCache();
 
-	// 5. Build response
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("output_mode"), OutputMode);
-	Result->SetStringField(TEXT("trace_file"), TraceFile);
-	Result->SetNumberField(TEXT("channel_count"), Channels.Num());
+	Result->SetStringField(TEXT("connection_type"), FInsightContext::ConnectionTypeToString(Context.ActiveConnectionType));
+	Result->SetStringField(TEXT("destination"), Context.ActiveTraceDestination);
+	Result->SetStringField(TEXT("trace_file"), Context.ActiveTraceFile);
+	Result->SetBoolField(TEXT("managed_by_mcp"), true);
+	Result->SetBoolField(TEXT("include_tail"), bIncludeTail);
+	Result->SetNumberField(TEXT("requested_channel_count"), RequestedChannels.Num());
 
-	TArray<TSharedPtr<FJsonValue>> ChannelArray;
-	for (const FString& Ch : Channels)
+	TArray<TSharedPtr<FJsonValue>> RequestedArray;
+	for (const FString& Channel : RequestedChannels)
 	{
-		ChannelArray.Add(MakeShared<FJsonValueString>(Ch.TrimStartAndEnd()));
+		RequestedArray.Add(MakeShared<FJsonValueString>(Channel));
 	}
-	Result->SetArrayField(TEXT("channels"), ChannelArray);
+	Result->SetArrayField(TEXT("requested_channels"), RequestedArray);
 
-#if ENGINE_MAJOR_VERSION < 5
-	// UE4 RDCSP extra info
-	Result->SetNumberField(TEXT("rdcsp_connect_port"), Trace::GetConnectPort());
-	Result->SetNumberField(TEXT("trace_memory_used"), Trace::GetMemoryUsed());
-#endif
+	TArray<TSharedPtr<FJsonValue>> EnabledArray;
+	for (const FString& Channel : Context.EnabledChannels)
+	{
+		EnabledArray.Add(MakeShared<FJsonValueString>(Channel));
+	}
+	Result->SetArrayField(TEXT("enabled_channels"), EnabledArray);
+	Result->SetNumberField(TEXT("enabled_channel_count"), EnabledArray.Num());
 
-	UE_LOG(LogInsightMCP, Log, TEXT("Trace started: mode=%s, file=%s, channels=%d"),
-		*OutputMode, *TraceFile, Channels.Num());
+	UE_LOG(LogInsightMCP, Log, TEXT("Trace started: mode=%s, destination=%s, requested_channels=%d"),
+		*OutputMode, *Context.ActiveTraceDestination, RequestedChannels.Num());
 
 	return CreateSuccessResponse(Result);
 }
@@ -228,9 +479,18 @@ bool FTraceStopAction::Validate(
 	FInsightContext& Context,
 	FString& OutError)
 {
+	Context.RefreshTraceStateFromNative();
 	if (!Context.bIsTracing)
 	{
 		OutError = TEXT("No Trace is currently running.");
+		return false;
+	}
+	if (!Context.bTraceStartedByMCP && !GetOptionalBool(Params, TEXT("force_external"), false))
+	{
+		OutError = FString::Printf(
+			TEXT("Current Trace is external (%s: %s). Set force_external=true to stop it explicitly."),
+			*FInsightContext::ConnectionTypeToString(Context.ActiveConnectionType),
+			*Context.ActiveTraceDestination);
 		return false;
 	}
 	return true;
@@ -240,49 +500,85 @@ TSharedPtr<FJsonObject> FTraceStopAction::ExecuteInternal(
 	const TSharedPtr<FJsonObject>& Params,
 	FInsightContext& Context)
 {
-	double ElapsedSeconds = FPlatformTime::Seconds() - Context.TraceStartTime;
-	FString TraceFile = Context.ActiveTraceFile;
+	Context.RefreshTraceStateFromNative();
 
-	// Stop Trace
+	const bool bManagedByMCP = Context.bTraceStartedByMCP;
+	const bool bDurationKnown = Context.bTraceStartTimeKnown;
+	const double ElapsedSeconds = bDurationKnown
+		? FPlatformTime::Seconds() - Context.TraceStartTime
+		: 0.0;
+	const FTraceAuxiliary::EConnectionType ConnectionType = Context.ActiveConnectionType;
+	const FString Destination = Context.ActiveTraceDestination;
+	const FString TraceFile = ConnectionType == FTraceAuxiliary::EConnectionType::File
+		? NormalizeTraceFilePath(Destination)
+		: FString();
+
 #if ENGINE_MAJOR_VERSION >= 5
-	FTraceAuxiliary::Stop();
+	const bool bStopAccepted = FTraceAuxiliary::Stop();
 #else
-	// UE4 RDCSP: Trace::Stop() is the direct API
-	// Also disable channels we enabled
-	for (const FString& Ch : Context.EnabledChannels)
-	{
-		if (Trace::IsChannel(*Ch))
-		{
-			Trace::ToggleChannel(*Ch, false);
-		}
-	}
-	Trace::Stop();
+	const bool bStopAccepted = Trace::Stop();
 #endif
-
-	// Get file size if applicable
-	int64 FileSize = 0;
-	if (!TraceFile.IsEmpty() && IFileManager::Get().FileExists(*TraceFile))
+	if (!bStopAccepted)
 	{
-		FileSize = IFileManager::Get().FileSize(*TraceFile);
+		return CreateErrorResponse(TEXT("Native Trace system rejected stop request"), TEXT("trace_stop_failed"));
 	}
 
-	// Update context
-	Context.bIsTracing = false;
-	// Keep ActiveTraceFile for reference (user might want to analyze it)
+	Context.ClearActiveTraceState();
 	Context.InvalidateCache();
 
-	// Build response
-	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-	Result->SetStringField(TEXT("trace_file"), TraceFile);
-	Result->SetNumberField(TEXT("duration_seconds"), ElapsedSeconds);
-	Result->SetNumberField(TEXT("file_size_bytes"), static_cast<double>(FileSize));
-	Result->SetStringField(TEXT("file_size_human"), 
-		FileSize > 1024 * 1024 
-			? FString::Printf(TEXT("%.1f MB"), FileSize / (1024.0 * 1024.0))
-			: FString::Printf(TEXT("%.1f KB"), FileSize / 1024.0));
+	FFileSettlement FileSettlement;
+	if (ConnectionType == FTraceAuxiliary::EConnectionType::File && !TraceFile.IsEmpty())
+	{
+		FileSettlement = WaitForFileSettlement(TraceFile);
+	}
 
-	UE_LOG(LogInsightMCP, Log, TEXT("Trace stopped: file=%s, duration=%.1fs, size=%lld bytes"),
-		*TraceFile, ElapsedSeconds, FileSize);
+	bool bRestoredPrevious = false;
+	bool bRestoreSkipped = false;
+#if ENGINE_MAJOR_VERSION >= 5
+	if (GetOptionalBool(Params, TEXT("restore_previous"), true) && Context.bHasPreviousTrace)
+	{
+		bRestoreSkipped = Context.PreviousConnectionType != FTraceAuxiliary::EConnectionType::Network;
+		bRestoredPrevious = RestorePreviousNetworkTrace(Context);
+	}
+	else if (Context.bHasPreviousTrace)
+	{
+		Context.ClearPreviousTraceState();
+	}
+#endif
+
+	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("stop_accepted"), true);
+	Result->SetBoolField(TEXT("managed_by_mcp"), bManagedByMCP);
+	Result->SetBoolField(TEXT("duration_known"), bDurationKnown);
+	if (bDurationKnown)
+	{
+		Result->SetNumberField(TEXT("duration_seconds"), ElapsedSeconds);
+	}
+	Result->SetStringField(TEXT("connection_type"), FInsightContext::ConnectionTypeToString(ConnectionType));
+	Result->SetStringField(TEXT("destination"), Destination);
+	Result->SetStringField(TEXT("trace_file"), TraceFile);
+	Result->SetBoolField(TEXT("file_size_applicable"), ConnectionType == FTraceAuxiliary::EConnectionType::File);
+	if (ConnectionType == FTraceAuxiliary::EConnectionType::File)
+	{
+		Result->SetBoolField(TEXT("file_exists"), FileSettlement.bExists);
+		Result->SetBoolField(TEXT("file_size_known"), FileSettlement.bSizeKnown);
+		Result->SetBoolField(TEXT("file_size_pending"), FileSettlement.bPending);
+		if (FileSettlement.bSizeKnown)
+		{
+			Result->SetNumberField(TEXT("file_size_bytes"), static_cast<double>(FileSettlement.Size));
+			Result->SetStringField(TEXT("file_size_human"),
+				FileSettlement.Size > 1024 * 1024
+					? FString::Printf(TEXT("%.1f MB"), FileSettlement.Size / (1024.0 * 1024.0))
+					: FString::Printf(TEXT("%.1f KB"), FileSettlement.Size / 1024.0));
+		}
+	}
+	Result->SetBoolField(TEXT("restored_previous"), bRestoredPrevious);
+	Result->SetBoolField(TEXT("previous_restore_skipped"), bRestoreSkipped);
+
+	UE_LOG(LogInsightMCP, Log, TEXT("Trace stopped: destination=%s, duration_known=%s, restored_previous=%s"),
+		*Destination,
+		bDurationKnown ? TEXT("true") : TEXT("false"),
+		bRestoredPrevious ? TEXT("true") : TEXT("false"));
 
 	return CreateSuccessResponse(Result);
 }
@@ -296,62 +592,11 @@ TSharedPtr<FJsonObject> FTraceStatusAction::ExecuteInternal(
 	const TSharedPtr<FJsonObject>& Params,
 	FInsightContext& Context)
 {
-	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
+	Context.RefreshTraceStateFromNative();
 
-	// Use the native IsTracing() as ground truth
-#if ENGINE_MAJOR_VERSION >= 5
-	bool bActuallyTracing = UE::Trace::IsTracing();
-#else
-	bool bActuallyTracing = Trace::IsTracing();
-#endif
-	Result->SetBoolField(TEXT("is_tracing"), bActuallyTracing);
-	Result->SetStringField(TEXT("active_trace_file"), Context.ActiveTraceFile);
-
-	// Sync context if out of date
-	if (bActuallyTracing != Context.bIsTracing)
-	{
-		Context.bIsTracing = bActuallyTracing;
-	}
-
-	if (Context.bIsTracing && Context.TraceStartTime > 0.0)
-	{
-		double ElapsedSeconds = FPlatformTime::Seconds() - Context.TraceStartTime;
-		Result->SetNumberField(TEXT("elapsed_seconds"), ElapsedSeconds);
-	}
-
-	// Enabled channels
-	TArray<TSharedPtr<FJsonValue>> ChannelArray;
-	for (const FString& Ch : Context.EnabledChannels)
-	{
-		ChannelArray.Add(MakeShared<FJsonValueString>(Ch));
-	}
-	Result->SetArrayField(TEXT("enabled_channels"), ChannelArray);
-	Result->SetNumberField(TEXT("enabled_channel_count"), Context.EnabledChannels.Num());
-
-	// Session state
-	Result->SetBoolField(TEXT("session_loaded"), Context.bSessionLoaded);
-	Result->SetStringField(TEXT("current_session_file"), Context.CurrentSessionFile);
-
-	// Default trace dir
-	Result->SetStringField(TEXT("default_trace_dir"), FInsightContext::GetDefaultTraceDir());
-
-#if ENGINE_MAJOR_VERSION < 5
-	// UE4 RDCSP extra diagnostics
-	Result->SetNumberField(TEXT("trace_memory_used"), Trace::GetMemoryUsed());
-	Result->SetNumberField(TEXT("rdcsp_connect_port"), Trace::GetConnectPort());
-
-	// Get trace statistics if available
-	Trace::FStatistics Stats;
-	Trace::GetStatistics(Stats);
-	Result->SetNumberField(TEXT("bytes_sent"), static_cast<double>(Stats.BytesSent));
-	Result->SetNumberField(TEXT("bytes_traced"), static_cast<double>(Stats.BytesTraced));
-	Result->SetNumberField(TEXT("memory_used"), Stats.MemoryUsed);
-	Result->SetNumberField(TEXT("cache_used"), Stats.CacheUsed);
-#endif
-
+	TSharedPtr<FJsonObject> Result = Context.ToJson();
 	Result->SetNumberField(TEXT("engine_major_version"), ENGINE_MAJOR_VERSION);
 	Result->SetNumberField(TEXT("engine_minor_version"), ENGINE_MINOR_VERSION);
-
 	return CreateSuccessResponse(Result);
 }
 
@@ -364,66 +609,55 @@ TSharedPtr<FJsonObject> FTraceChannelsListAction::ExecuteInternal(
 	const TSharedPtr<FJsonObject>& Params,
 	FInsightContext& Context)
 {
-	struct FChannelInfo
-	{
-		FString Name;
-		bool bEnabled;
-	};
-	TArray<FChannelInfo> ChannelList;
+	Context.RefreshTraceStateFromNative();
 
-#if ENGINE_MAJOR_VERSION >= 5
-	// UE5: use the native EnumerateChannels API
-	UE::Trace::EnumerateChannels(
-		[](const ANSICHAR* Name, bool bEnabled, void* UserData)
-		{
-			auto* List = static_cast<TArray<FChannelInfo>*>(UserData);
-			List->Add({FString(ANSI_TO_TCHAR(Name)), bEnabled});
-		},
-		&ChannelList);
-#else
-	// UE4 RDCSP: no EnumerateChannels — probe known channels via Trace::IsChannel
-	for (int32 i = 0; i < InsightMCPCompat::NumKnownChannels; ++i)
+	TArray<FChannelInfoSnapshot> ChannelList;
+	EnumerateChannelSnapshots(ChannelList);
+	ChannelList.Sort([](const FChannelInfoSnapshot& A, const FChannelInfoSnapshot& B)
 	{
-		const TCHAR* ChannelName = InsightMCPCompat::KnownChannels[i];
-		if (Trace::IsChannel(ChannelName))
-		{
-			// Channel exists in this build.
-			// We check if it's in our context's enabled set to report status.
-			bool bEnabled = Context.EnabledChannels.Contains(FString(ChannelName));
-			ChannelList.Add({FString(ChannelName), bEnabled});
-		}
-	}
-#endif
+		return A.Name < B.Name;
+	});
 
-	// Build response
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetNumberField(TEXT("total_channels"), ChannelList.Num());
 
 	TArray<TSharedPtr<FJsonValue>> ChannelsJson;
 	TArray<TSharedPtr<FJsonValue>> EnabledJson;
+	TArray<TSharedPtr<FJsonValue>> StartupOnlyJson;
 
-	for (const FChannelInfo& Info : ChannelList)
+	for (const FChannelInfoSnapshot& Info : ChannelList)
 	{
-		TSharedPtr<FJsonObject> ChObj = MakeShared<FJsonObject>();
-		ChObj->SetStringField(TEXT("name"), Info.Name);
-		ChObj->SetBoolField(TEXT("enabled"), Info.bEnabled);
-		ChannelsJson.Add(MakeShared<FJsonValueObject>(ChObj));
+		TSharedPtr<FJsonObject> ChannelObject = MakeShared<FJsonObject>();
+		ChannelObject->SetStringField(TEXT("name"), Info.Name);
+		ChannelObject->SetStringField(TEXT("raw_name"), Info.RawName);
+		ChannelObject->SetStringField(TEXT("description"), Info.Description);
+		ChannelObject->SetBoolField(TEXT("enabled"), Info.bEnabled);
+		ChannelObject->SetBoolField(TEXT("read_only"), Info.bReadOnly);
+		ChannelObject->SetBoolField(TEXT("startup_only"), Info.bReadOnly);
+		ChannelObject->SetBoolField(TEXT("runtime_toggleable"), !Info.bReadOnly);
+		ChannelsJson.Add(MakeShared<FJsonValueObject>(ChannelObject));
 
 		if (Info.bEnabled)
 		{
 			EnabledJson.Add(MakeShared<FJsonValueString>(Info.Name));
 		}
+		if (Info.bReadOnly)
+		{
+			StartupOnlyJson.Add(MakeShared<FJsonValueString>(Info.Name));
+		}
 	}
 
 	Result->SetArrayField(TEXT("channels"), ChannelsJson);
 	Result->SetArrayField(TEXT("enabled"), EnabledJson);
+	Result->SetArrayField(TEXT("startup_only"), StartupOnlyJson);
 	Result->SetNumberField(TEXT("enabled_count"), EnabledJson.Num());
-
-#if ENGINE_MAJOR_VERSION < 5
-	Result->SetStringField(TEXT("enumeration_method"), TEXT("known_channel_probe"));
+	Result->SetStringField(TEXT("enumeration_method"),
+#if ENGINE_MAJOR_VERSION >= 5
+		TEXT("native_channel_info")
 #else
-	Result->SetStringField(TEXT("enumeration_method"), TEXT("native_enumerate"));
+		TEXT("known_channel_probe")
 #endif
+	);
 
 	return CreateSuccessResponse(Result);
 }
@@ -439,58 +673,78 @@ bool FTraceChannelsToggleAction::Validate(
 	FString& OutError)
 {
 	FString Channels;
-	if (!GetRequiredString(Params, TEXT("channels"), Channels, OutError))
-	{
-		return false;
-	}
-	return true;
+	return GetRequiredString(Params, TEXT("channels"), Channels, OutError);
 }
 
 TSharedPtr<FJsonObject> FTraceChannelsToggleAction::ExecuteInternal(
 	const TSharedPtr<FJsonObject>& Params,
 	FInsightContext& Context)
 {
-	FString ChannelStr;
+	FString ChannelString;
 	FString Unused;
-	GetRequiredString(Params, TEXT("channels"), ChannelStr, Unused);
+	GetRequiredString(Params, TEXT("channels"), ChannelString, Unused);
+	const bool bEnable = GetOptionalBool(Params, TEXT("enable"), true);
 
-	bool bEnable = GetOptionalBool(Params, TEXT("enable"), true);
+	TArray<FString> Requested;
+	ExpandChannelTokens(ChannelString, Requested);
+	TArray<FChannelInfoSnapshot> Available;
+	EnumerateChannelSnapshots(Available);
 
-	TArray<FString> Channels;
-	ChannelStr.ParseIntoArray(Channels, TEXT(","));
-
-	TArray<TSharedPtr<FJsonValue>> ToggledArray;
-	for (const FString& Channel : Channels)
+	TArray<FString> Errors;
+	for (const FString& Name : Requested)
 	{
-		FString TrimmedChannel = Channel.TrimStartAndEnd();
-
-		// ToggleChannel: UE5 uses UE::Trace namespace, UE4 uses Trace namespace
-#if ENGINE_MAJOR_VERSION >= 5
-		UE::Trace::ToggleChannel(*TrimmedChannel, bEnable);
-#else
-		Trace::ToggleChannel(*TrimmedChannel, bEnable);
-#endif
-
-		if (bEnable)
+		const FChannelInfoSnapshot* Channel = FindChannelSnapshot(Available, Name);
+		if (!Channel)
 		{
-			Context.EnabledChannels.Add(TrimmedChannel);
+			Errors.Add(FString::Printf(TEXT("Unknown Trace channel '%s'"), *Name));
 		}
-		else
+		else if (Channel->bReadOnly && Channel->bEnabled != bEnable)
 		{
-			Context.EnabledChannels.Remove(TrimmedChannel);
+			Errors.Add(FString::Printf(
+				TEXT("Trace channel '%s' is startup-only and currently %s"),
+				*Channel->Name,
+				Channel->bEnabled ? TEXT("enabled") : TEXT("disabled")));
 		}
-
-		ToggledArray.Add(MakeShared<FJsonValueString>(TrimmedChannel));
+	}
+	if (Errors.Num() > 0)
+	{
+		return CreateErrorResponse(FString::Join(Errors, TEXT("; ")), TEXT("channel_toggle_rejected"));
 	}
 
+	TArray<TSharedPtr<FJsonValue>> ResultsArray;
+	for (const FString& Name : Requested)
+	{
+		const FChannelInfoSnapshot* Before = FindChannelSnapshot(Available, Name);
+		const bool bBefore = Before && Before->bEnabled;
+		if (Before && !Before->bReadOnly && bBefore != bEnable)
+		{
+#if ENGINE_MAJOR_VERSION >= 5
+			UE::Trace::ToggleChannel(*Before->Name, bEnable);
+#else
+			Trace::ToggleChannel(*Before->Name, bEnable);
+#endif
+		}
+
+		TArray<FChannelInfoSnapshot> AfterChannels;
+		EnumerateChannelSnapshots(AfterChannels);
+		const FChannelInfoSnapshot* After = FindChannelSnapshot(AfterChannels, Name);
+		const bool bAfter = After && After->bEnabled;
+
+		TSharedPtr<FJsonObject> ChannelResult = MakeShared<FJsonObject>();
+		ChannelResult->SetStringField(TEXT("name"), Name);
+		ChannelResult->SetBoolField(TEXT("read_only"), Before && Before->bReadOnly);
+		ChannelResult->SetBoolField(TEXT("changed"), bBefore != bAfter);
+		ChannelResult->SetBoolField(TEXT("enabled"), bAfter);
+		ChannelResult->SetBoolField(TEXT("request_satisfied"), bAfter == bEnable);
+		ResultsArray.Add(MakeShared<FJsonValueObject>(ChannelResult));
+	}
+
+	Context.RefreshTraceStateFromNative();
+
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
-	Result->SetArrayField(TEXT("toggled_channels"), ToggledArray);
-	Result->SetBoolField(TEXT("enabled"), bEnable);
-	Result->SetNumberField(TEXT("count"), Channels.Num());
-
-	UE_LOG(LogInsightMCP, Log, TEXT("Channels toggled: %s -> %s"),
-		*ChannelStr, bEnable ? TEXT("enabled") : TEXT("disabled"));
-
+	Result->SetBoolField(TEXT("requested_enabled"), bEnable);
+	Result->SetNumberField(TEXT("count"), Requested.Num());
+	Result->SetArrayField(TEXT("channels"), ResultsArray);
 	return CreateSuccessResponse(Result);
 }
 
@@ -509,6 +763,12 @@ bool FTraceBookmarkAction::Validate(
 	{
 		return false;
 	}
+	Context.RefreshTraceStateFromNative();
+	if (!Context.bIsTracing)
+	{
+		OutError = TEXT("Cannot add a bookmark because no Trace connection is active.");
+		return false;
+	}
 	return true;
 }
 
@@ -520,20 +780,18 @@ TSharedPtr<FJsonObject> FTraceBookmarkAction::ExecuteInternal(
 	FString Unused;
 	GetRequiredString(Params, TEXT("label"), Label, Unused);
 
-	// TRACE_BOOKMARK works on both UE4 and UE5 (defined in ProfilingDebugging/MiscTrace.h)
 	TRACE_BOOKMARK(TEXT("%s"), *Label);
 
-	double CurrentTime = FPlatformTime::Seconds();
-	double TraceRelativeTime = Context.bIsTracing ? (CurrentTime - Context.TraceStartTime) : 0.0;
-
+	const double CurrentTime = FPlatformTime::Seconds();
 	TSharedPtr<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("label"), Label);
 	Result->SetNumberField(TEXT("timestamp"), CurrentTime);
-	Result->SetNumberField(TEXT("trace_relative_seconds"), TraceRelativeTime);
 	Result->SetBoolField(TEXT("trace_active"), Context.bIsTracing);
-
-	UE_LOG(LogInsightMCP, Log, TEXT("Bookmark added: '%s' at %.3fs relative"),
-		*Label, TraceRelativeTime);
+	Result->SetBoolField(TEXT("trace_relative_time_known"), Context.bTraceStartTimeKnown);
+	if (Context.bTraceStartTimeKnown)
+	{
+		Result->SetNumberField(TEXT("trace_relative_seconds"), CurrentTime - Context.TraceStartTime);
+	}
 
 	return CreateSuccessResponse(Result);
 }
@@ -571,7 +829,6 @@ TSharedPtr<FJsonObject> FBatchExecuteInsightAction::ExecuteInternal(
 	const bool bContinueOnError = GetOptionalBool(Params, TEXT("continue_on_error"), false);
 	const bool bStopOnError = bContinueOnError ? false : GetOptionalBool(Params, TEXT("stop_on_error"), true);
 
-	// Get InsightBridge to dispatch sub-commands
 	UInsightBridge* Bridge = GEditor ? GEditor->GetEditorSubsystem<UInsightBridge>() : nullptr;
 	if (!Bridge)
 	{
@@ -626,11 +883,8 @@ TSharedPtr<FJsonObject> FBatchExecuteInsightAction::ExecuteInternal(
 		}
 
 		UE_LOG(LogInsightMCP, Log, TEXT("Batch[%d/%d]: executing '%s'"), i + 1, Total, *CmdType);
-
-		// Execute sub-command via Bridge (already on GameThread, bypasses TCP)
 		TSharedPtr<FJsonObject> SubResult = Bridge->ExecuteCommand(CmdType, CmdParams);
 
-		// Tag result with index and type
 		if (SubResult.IsValid())
 		{
 			SubResult->SetNumberField(TEXT("index"), i);
